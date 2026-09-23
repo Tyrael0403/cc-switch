@@ -21,7 +21,7 @@ use futures::stream::{Stream, StreamExt};
 use serde_json::Value;
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -343,6 +343,9 @@ pub async fn process_response(
 
 type UsageCallbackWithTiming = Arc<dyn Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static>;
 
+/// `first_token_ms` 的「尚未记录」哨兵值（毫秒数不可能取到该值）
+const FIRST_TOKEN_UNSET: u64 = u64::MAX;
+
 /// SSE 使用量收集器
 #[derive(Clone)]
 pub struct SseUsageCollector {
@@ -351,30 +354,36 @@ pub struct SseUsageCollector {
 
 struct SseUsageCollectorInner {
     events: Mutex<Vec<Value>>,
-    first_event_time: Mutex<Option<std::time::Instant>>,
-    first_event_set: AtomicBool,
+    /// 首个产出事件（首字）相对 `start_time` 的毫秒数；`FIRST_TOKEN_UNSET` 表示未记录
+    first_token_ms: AtomicU64,
     start_time: std::time::Instant,
     on_complete: UsageCallbackWithTiming,
     should_collect: Option<StreamUsageEventFilter>,
+    stream_start_filter: Option<StreamUsageEventFilter>,
     finished: AtomicBool,
 }
 
 impl SseUsageCollector {
-    /// 创建使用量收集器；`should_collect` 用来在 hot path 跳过与 usage 无关的事件。
+    /// 创建使用量收集器。
+    ///
+    /// - `should_collect` 用来在 hot path 跳过与 usage 无关的事件（命中才解析 JSON）；
+    /// - `stream_start_filter` 用来在 hot path 识别首个「产出」事件，即首字计时。
+    ///   两者必须分开：usage 事件通常在流末尾，用它计时会把首字记成整段耗时。
     pub fn new(
         start_time: std::time::Instant,
         should_collect: Option<StreamUsageEventFilter>,
+        stream_start_filter: Option<StreamUsageEventFilter>,
         callback: impl Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static,
     ) -> Self {
         let on_complete: UsageCallbackWithTiming = Arc::new(callback);
         Self {
             inner: Arc::new(SseUsageCollectorInner {
                 events: Mutex::new(Vec::new()),
-                first_event_time: Mutex::new(None),
-                first_event_set: AtomicBool::new(false),
+                first_token_ms: AtomicU64::new(FIRST_TOKEN_UNSET),
                 start_time,
                 on_complete,
                 should_collect,
+                stream_start_filter,
                 finished: AtomicBool::new(false),
             }),
         }
@@ -387,21 +396,34 @@ impl SseUsageCollector {
             .unwrap_or(true)
     }
 
-    /// 标记首个被收集的 SSE 事件时间，沿用 `first_token_ms` 的既有近似语义。
-    async fn mark_first_collected_event_time(&self) {
-        if self.inner.first_event_set.load(Ordering::Acquire) {
+    /// 记录首个「产出」事件（首字）的耗时。
+    ///
+    /// 需要在 hot path 对每个 SSE data 行调用，且必须在 `push` 之前：codex 的
+    /// usage 只出现在 `response.completed`（流末尾），若等到收集 usage 时才打点，
+    /// `first_token_ms` 会等于整段耗时，前端据此算出的 TPS 会虚高几个数量级。
+    ///
+    /// 首个命中之后退化为一次原子读 + 提前返回；不解析 JSON。
+    pub fn mark_stream_start(&self, data: &str) {
+        if self.inner.first_token_ms.load(Ordering::Relaxed) != FIRST_TOKEN_UNSET {
             return;
         }
-        let mut first_time = self.inner.first_event_time.lock().await;
-        if first_time.is_none() {
-            *first_time = Some(std::time::Instant::now());
-            self.inner.first_event_set.store(true, Ordering::Release);
+        let Some(stream_start_filter) = self.inner.stream_start_filter else {
+            return;
+        };
+        if !stream_start_filter(data) {
+            return;
         }
+        let elapsed_ms = self.inner.start_time.elapsed().as_millis() as u64;
+        let _ = self.inner.first_token_ms.compare_exchange(
+            FIRST_TOKEN_UNSET,
+            elapsed_ms,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
     }
 
     /// 推送 SSE 事件
     pub async fn push(&self, event: Value) {
-        self.mark_first_collected_event_time().await;
         let mut events = self.inner.events.lock().await;
         events.push(event);
     }
@@ -417,9 +439,9 @@ impl SseUsageCollector {
             std::mem::take(&mut *guard)
         };
 
-        let first_token_ms = {
-            let first_time = self.inner.first_event_time.lock().await;
-            first_time.map(|t| (t - self.inner.start_time).as_millis() as u64)
+        let first_token_ms = match self.inner.first_token_ms.load(Ordering::Acquire) {
+            FIRST_TOKEN_UNSET => None,
+            elapsed_ms => Some(elapsed_ms),
         };
 
         (self.inner.on_complete)(events, first_token_ms);
@@ -498,6 +520,7 @@ pub(crate) fn create_usage_collector(
     Some(SseUsageCollector::new(
         start_time,
         parser_config.stream_event_filter,
+        parser_config.stream_start_filter,
         move |events, first_token_ms| {
             if let Some(usage) = stream_parser(&events) {
                 let model = model_extractor(&events, &fallback_model);
@@ -756,16 +779,23 @@ pub fn create_logged_passthrough_stream(
                                     if let Some(data) = strip_sse_field(line, "data") {
                                         if data.trim() != "[DONE]" {
                                             let collected = match &collector {
-                                                Some(c) if c.should_collect(data) => {
-                                                    match serde_json::from_str::<Value>(data) {
-                                                        Ok(json_value) => {
-                                                            c.push(json_value).await;
-                                                            true
+                                                Some(c) => {
+                                                    // 首字打点必须先于 usage 收集：usage 事件
+                                                    // 多在流末尾，不能用来当首字时间。
+                                                    c.mark_stream_start(data);
+                                                    if c.should_collect(data) {
+                                                        match serde_json::from_str::<Value>(data) {
+                                                            Ok(json_value) => {
+                                                                c.push(json_value).await;
+                                                                true
+                                                            }
+                                                            Err(_) => false,
                                                         }
-                                                        Err(_) => false,
+                                                    } else {
+                                                        false
                                                     }
                                                 }
-                                                _ => false,
+                                                None => false,
                                             };
                                             log::trace!(
                                                 "[{tag}] <<< SSE data: bytes={}, usage_collected={collected} (content omitted)",
@@ -1279,5 +1309,109 @@ mod tests {
             Decimal::from_str("1.5").unwrap()
         );
         Ok(())
+    }
+
+    /// 模拟 hot path（`create_logged_passthrough_stream` 中的调用顺序）：
+    /// 每个 SSE data 行先打点首字，再判断是否需要收集 usage。
+    async fn feed_sse_data(collector: &SseUsageCollector, data: &str) {
+        collector.mark_stream_start(data);
+        if collector.should_collect(data) {
+            if let Ok(value) = serde_json::from_str::<Value>(data) {
+                collector.push(value).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn logged_passthrough_stream_times_first_token_before_usage_event() {
+        // 端到端复现线上现象：codex 的 usage 只在流末尾的 response.completed 里，
+        // 首字时间必须取自首个产出事件，否则会等于整段耗时（前端算出十万级 tps）
+        type Observed = Arc<std::sync::Mutex<Option<(Vec<Value>, Option<u64>)>>>;
+
+        let start = std::time::Instant::now();
+        let observed: Observed = Arc::new(std::sync::Mutex::new(None));
+        let observed_handle = Arc::clone(&observed);
+
+        let collector = SseUsageCollector::new(
+            start,
+            crate::proxy::handler_config::CODEX_PARSER_CONFIG.stream_event_filter,
+            crate::proxy::handler_config::CODEX_PARSER_CONFIG.stream_start_filter,
+            move |events, first_token_ms| {
+                *observed_handle.lock().unwrap() = Some((events, first_token_ms));
+            },
+        );
+
+        let upstream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+            ));
+            yield Ok(Bytes::from_static(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            ));
+            // 生成过程中 usage 尚未出现
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            yield Ok(Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
+            ));
+        };
+
+        let mut logged = Box::pin(create_logged_passthrough_stream(
+            upstream,
+            "Test",
+            Some(collector),
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+        ));
+        while let Some(chunk) = logged.next().await {
+            chunk.expect("透传流不应报错");
+        }
+
+        let (events, first_token_ms) = observed.lock().unwrap().take().expect("流结束应触发回调");
+        assert_eq!(
+            TokenUsage::from_codex_stream_events_auto(&events)
+                .expect("usage 事件应被收集")
+                .output_tokens,
+            2
+        );
+        let first_token_ms = first_token_ms.expect("首字时间应被记录");
+        let latency_ms = start.elapsed().as_millis() as u64;
+        assert!(
+            first_token_ms + 30 <= latency_ms,
+            "首字应记在产出事件处而非流末尾: first_token_ms={first_token_ms}, latency_ms={latency_ms}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collector_reports_no_first_token_without_output_event() {
+        let start = std::time::Instant::now();
+        let observed: Arc<std::sync::Mutex<Option<Option<u64>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let observed_handle = Arc::clone(&observed);
+
+        let collector = SseUsageCollector::new(
+            start,
+            Some(crate::proxy::handler_config::codex_stream_usage_event_filter),
+            Some(crate::proxy::handler_config::codex_stream_start_filter),
+            move |_events, first_token_ms| {
+                *observed_handle.lock().unwrap() = Some(first_token_ms);
+            },
+        );
+
+        // 只有 preamble 与终态事件：首字时间无法测量，必须返回 None，
+        // 前端会退化为「用整体用时估算 TPS」，而不是把它当成 0 时长算出天文数字
+        feed_sse_data(&collector, r#"{"type":"response.created"}"#).await;
+        feed_sse_data(
+            &collector,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        )
+        .await;
+
+        collector.finish().await;
+
+        let first_token_ms = observed.lock().unwrap().expect("callback 应被调用");
+        assert_eq!(first_token_ms, None);
     }
 }

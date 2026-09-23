@@ -31,6 +31,12 @@ pub struct UsageParserConfig {
     pub model_extractor: StreamModelExtractor,
     /// 流式 usage 事件预过滤器
     pub stream_event_filter: Option<StreamUsageEventFilter>,
+    /// 流式「开始产出」事件预过滤器（首个 token 增量）
+    ///
+    /// 仅用于 first_token_ms（首字）计时。必须与 `stream_event_filter` 分开：
+    /// usage 事件通常在流末尾（如 Codex 的 `response.completed`），用它计时会把
+    /// 首字算成整段耗时。
+    pub stream_start_filter: Option<StreamUsageEventFilter>,
     /// 应用类型字符串（用于日志记录）
     pub app_type_str: &'static str,
 }
@@ -53,6 +59,37 @@ pub fn codex_stream_usage_event_filter(data: &str) -> bool {
 
 fn gemini_stream_usage_event_filter(data: &str) -> bool {
     data.contains("\"usageMetadata\"")
+}
+
+// ============================================================================
+// 流式「开始产出」事件预过滤（首字计时）
+// ============================================================================
+//
+// 与上面的 usage 过滤器相互独立，只做子串匹配：命中即记录首字时间，
+// 不解析 JSON，也不进入 usage 收集。
+
+/// Claude Messages 首个产出事件（含 text / thinking / 工具入参增量）
+pub fn claude_stream_start_filter(data: &str) -> bool {
+    data.contains("\"content_block_delta\"")
+}
+
+/// OpenAI Chat Completions 首个产出事件（choices[].delta 增量）
+fn openai_stream_start_filter(data: &str) -> bool {
+    data.contains("\"delta\"")
+}
+
+/// Codex Responses 首个产出事件（各类 `.delta` 增量）
+pub fn codex_stream_start_filter(data: &str) -> bool {
+    data.contains("\"response.output_text.delta\"")
+        || data.contains("\"response.reasoning_summary_text.delta\"")
+        || data.contains("\"response.reasoning_text.delta\"")
+        || data.contains("\"response.reasoning.delta\"")
+        || data.contains("\"response.function_call_arguments.delta\"")
+}
+
+/// Gemini 首个产出事件（candidates[].content.parts[].text 增量）
+fn gemini_stream_start_filter(data: &str) -> bool {
+    data.contains("\"text\"")
 }
 
 // ============================================================================
@@ -141,6 +178,7 @@ pub const CLAUDE_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
     response_parser: TokenUsage::from_claude_response,
     model_extractor: claude_model_extractor,
     stream_event_filter: Some(claude_stream_usage_event_filter),
+    stream_start_filter: Some(claude_stream_start_filter),
     app_type_str: "claude",
 };
 
@@ -150,6 +188,7 @@ pub const OPENAI_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
     response_parser: TokenUsage::from_openai_response,
     model_extractor: openai_model_extractor,
     stream_event_filter: Some(openai_stream_usage_event_filter),
+    stream_start_filter: Some(openai_stream_start_filter),
     app_type_str: "codex",
 };
 
@@ -159,6 +198,7 @@ pub const CODEX_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
     response_parser: TokenUsage::from_codex_response_auto,
     model_extractor: codex_auto_model_extractor,
     stream_event_filter: Some(codex_stream_usage_event_filter),
+    stream_start_filter: Some(codex_stream_start_filter),
     app_type_str: "codex",
 };
 
@@ -168,6 +208,7 @@ pub const GEMINI_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
     response_parser: TokenUsage::from_gemini_response,
     model_extractor: gemini_model_extractor,
     stream_event_filter: Some(gemini_stream_usage_event_filter),
+    stream_start_filter: Some(gemini_stream_start_filter),
     app_type_str: "gemini",
 };
 
@@ -226,3 +267,42 @@ pub const GEMINI_HANDLER_CONFIG: HandlerConfig = HandlerConfig {
     app_type_str: "gemini",
     parser_config: &GEMINI_PARSER_CONFIG,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_stream_start_filter_ignores_usage_only_events() {
+        // codex 的 usage 只在 response.completed 出现（流末尾），不能参与首字计时
+        assert!(codex_stream_start_filter(
+            r#"{"type":"response.output_text.delta","delta":"hi"}"#
+        ));
+        assert!(codex_stream_start_filter(
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"think"}"#
+        ));
+        assert!(codex_stream_start_filter(
+            r#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#
+        ));
+        assert!(!codex_stream_start_filter(
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":1}}}"#
+        ));
+        assert!(!codex_stream_start_filter(r#"{"type":"response.created"}"#));
+    }
+
+    #[test]
+    fn claude_and_gemini_stream_start_filter_ignore_leading_events() {
+        assert!(claude_stream_start_filter(
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#
+        ));
+        assert!(!claude_stream_start_filter(r#"{"type":"message_start"}"#));
+        assert!(!claude_stream_start_filter(r#"{"type":"message_delta"}"#));
+
+        assert!(gemini_stream_start_filter(
+            r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#
+        ));
+        assert!(!gemini_stream_start_filter(
+            r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"totalTokenCount":3}}"#
+        ));
+    }
+}

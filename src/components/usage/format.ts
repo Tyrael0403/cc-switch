@@ -38,6 +38,16 @@ interface OutputTokensPerSecondInput {
   durationMs?: unknown;
 }
 
+/**
+ * 可测量的生成窗口下限（毫秒）。
+ *
+ * 历史记录里 `first_token_ms` 曾按「首个被收集的 SSE 事件」打点，Codex 的 usage
+ * 只在流末尾出现，差值常在 20ms 内，据此算出的 TPS 会虚高几个数量级。
+ * 低于该下限视为「测不出生成时长」，与此前 `firstTokenMs === latencyMs`
+ * 时一致地不展示 TPS，同时兜住存量脏数据。
+ */
+const MIN_MEASURABLE_GENERATION_MS = 50;
+
 function getOutputGenerationDurationMs(
   log: OutputTokensPerSecondInput,
 ): number | null {
@@ -49,7 +59,7 @@ function getOutputGenerationDurationMs(
     const latencyMs = parseFiniteNumber(log.latencyMs);
     if (latencyMs == null) return null;
     const generationMs = latencyMs - firstTokenMs;
-    return generationMs > 0 ? generationMs : null;
+    return generationMs >= MIN_MEASURABLE_GENERATION_MS ? generationMs : null;
   }
 
   const latencyMs = parseFiniteNumber(log.latencyMs);

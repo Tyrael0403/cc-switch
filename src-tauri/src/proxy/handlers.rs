@@ -12,8 +12,9 @@ use super::{
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::ActiveConnectionGuard,
     handler_config::{
-        claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
-        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
+        claude_stream_start_filter, claude_stream_usage_event_filter, codex_stream_start_filter,
+        codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG, CODEX_PARSER_CONFIG,
+        GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
     providers::{
@@ -472,6 +473,7 @@ async fn handle_claude_transform(
             Some(SseUsageCollector::new(
                 start_time,
                 Some(claude_stream_usage_event_filter),
+                Some(claude_stream_start_filter),
                 move |events, first_token_ms| {
                     if let Some(usage) = TokenUsage::from_claude_stream_events(&events) {
                         let model = usage
@@ -1366,6 +1368,7 @@ async fn handle_codex_chat_to_responses_transform(
             Some(SseUsageCollector::new(
                 start_time,
                 Some(codex_stream_usage_event_filter),
+                Some(codex_stream_start_filter),
                 move |events, first_token_ms| {
                     let usage =
                         TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
@@ -1745,6 +1748,7 @@ fn build_codex_anthropic_sse_response(
         Some(SseUsageCollector::new(
             start_time,
             Some(codex_stream_usage_event_filter),
+            Some(codex_stream_start_filter),
             move |events, first_token_ms| {
                 let usage = TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
                 if !usage.has_billable_tokens() {

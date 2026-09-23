@@ -63,6 +63,33 @@ describe("usage format helpers", () => {
     ).toBeNull();
   });
 
+  it("hides TPS when the generation window is too small to be measured", () => {
+    // 真实脏数据：codex 的 usage 只在流末尾出现，首字时间被记成整段用时，
+    // 差值只有 1-7ms，旧公式会算出十万级 tps
+    expect(
+      formatOutputTokensPerSecond({
+        outputTokens: 262,
+        latencyMs: 5_990,
+        firstTokenMs: 5_983,
+      }),
+    ).toBeNull();
+    expect(
+      formatOutputTokensPerSecond({
+        outputTokens: 1_745,
+        latencyMs: 34_915,
+        firstTokenMs: 34_914,
+      }),
+    ).toBeNull();
+    // 窗口可信时照常展示
+    expect(
+      formatOutputTokensPerSecond({
+        outputTokens: 100,
+        latencyMs: 5_000,
+        firstTokenMs: 3_000,
+      }),
+    ).toBe("50");
+  });
+
   it("formats TPS with integer or single-decimal precision", () => {
     expect(
       formatOutputTokensPerSecond({
