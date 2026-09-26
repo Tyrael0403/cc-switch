@@ -1,5 +1,31 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useTranslation } from "react-i18next";
+import { CSS } from "@dnd-kit/utilities";
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type Announcements,
+  type DragEndEvent,
+  type UniqueIdentifier,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
 import { Button } from "@/components/ui/button";
 import { FormLabel } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
@@ -36,6 +62,7 @@ import {
   ChevronRight,
   ChevronsUpDown,
   Download,
+  GripVertical,
   Loader2,
   Plus,
   Trash2,
@@ -149,6 +176,11 @@ interface CodexFormFieldsProps {
 }
 
 type CodexCatalogRow = CodexCatalogModel & { rowId: string };
+
+function getCatalogRowLabel(row: CodexCatalogRow, index: number): string {
+  const label = row.displayName?.trim() || row.model.trim();
+  return label ? `${label} (#${index + 1})` : `#${index + 1}`;
+}
 
 function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
   return {
@@ -361,6 +393,52 @@ function ReasoningLevelsEditor({
         )}
       </PopoverContent>
     </Popover>
+  );
+}
+
+function SortableCatalogRow({
+  rowId,
+  accessibleName,
+  children,
+}: {
+  rowId: string;
+  accessibleName: string;
+  children: ReactNode;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: rowId });
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+      }}
+      className={cn(
+        "grid grid-cols-[36px_minmax(0,1fr)] gap-2",
+        isDragging && "z-10 opacity-70",
+      )}
+    >
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="h-9 w-9 cursor-grab touch-none text-muted-foreground/60 hover:text-muted-foreground active:cursor-grabbing"
+        aria-label={accessibleName}
+        {...attributes}
+        {...listeners}
+      >
+        <GripVertical className="h-4 w-4" />
+      </Button>
+      {children}
+    </div>
   );
 }
 
@@ -645,6 +723,54 @@ export function CodexFormFields({
   const handleRemoveCatalogRow = useCallback((index: number) => {
     setCatalogRows((current) => current.filter((_, i) => i !== index));
   }, []);
+
+  const catalogDragSensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  const handleCatalogDragEnd = useCallback(({ active, over }: DragEndEvent) => {
+    if (!over || active.id === over.id) return;
+
+    setCatalogRows((current) => {
+      const oldIndex = current.findIndex((row) => row.rowId === active.id);
+      const newIndex = current.findIndex((row) => row.rowId === over.id);
+      if (oldIndex === -1 || newIndex === -1) return current;
+      return arrayMove(current, oldIndex, newIndex);
+    });
+  }, []);
+
+  const catalogDragHandleLabel = t("provider.dragHandle", {
+    defaultValue: "拖拽排序",
+  });
+  const getCatalogDragAnnouncementLabel = useCallback(
+    (id: UniqueIdentifier) => {
+      const index = catalogRows.findIndex((row) => row.rowId === id);
+      if (index === -1) return catalogDragHandleLabel;
+
+      return `${catalogDragHandleLabel}: ${getCatalogRowLabel(catalogRows[index], index)}`;
+    },
+    [catalogDragHandleLabel, catalogRows],
+  );
+  const catalogDragAnnouncements = useMemo<Announcements>(
+    () => ({
+      onDragStart: ({ active }) => getCatalogDragAnnouncementLabel(active.id),
+      onDragOver: ({ active, over }) =>
+        over
+          ? `${getCatalogDragAnnouncementLabel(active.id)} → ${getCatalogDragAnnouncementLabel(over.id)}`
+          : undefined,
+      onDragEnd: ({ active, over }) =>
+        over
+          ? `${getCatalogDragAnnouncementLabel(active.id)} → ${getCatalogDragAnnouncementLabel(over.id)}`
+          : undefined,
+      onDragCancel: ({ active }) => getCatalogDragAnnouncementLabel(active.id),
+    }),
+    [getCatalogDragAnnouncementLabel],
+  );
 
   // 默认模型下拉建议 = 模型映射的"实际请求模型"列 ∪ 拉取到的 /models 列表
   const defaultModelSuggestions = useMemo<FetchedModel[]>(() => {
@@ -1214,7 +1340,8 @@ export function CodexFormFields({
                 {catalogRows.length > 0 && (
                   <div className="space-y-2">
                     {/* 列头：md+ 显示 */}
-                    <div className="hidden grid-cols-[1fr_1fr_140px_1fr_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+                    <div className="hidden grid-cols-[36px_1fr_1fr_140px_1fr_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+                      <span aria-hidden="true" />
                       <span>
                         {t("codexConfig.catalogColumnDisplay", {
                           defaultValue: "菜单显示名",
@@ -1238,110 +1365,138 @@ export function CodexFormFields({
                       <span />
                     </div>
 
-                    {catalogRows.map((row, index) => (
-                      <div
-                        key={row.rowId}
-                        className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_140px_1fr_36px]"
+                    <DndContext
+                      sensors={catalogDragSensors}
+                      collisionDetection={closestCenter}
+                      onDragEnd={handleCatalogDragEnd}
+                      accessibility={{
+                        announcements: catalogDragAnnouncements,
+                      }}
+                    >
+                      <SortableContext
+                        items={catalogRows.map((row) => row.rowId)}
+                        strategy={verticalListSortingStrategy}
                       >
-                        <Input
-                          value={row.displayName ?? ""}
-                          onChange={(event) =>
-                            handleUpdateCatalogRow(index, {
-                              displayName: event.target.value,
-                            })
-                          }
-                          placeholder={t(
-                            "codexConfig.catalogDisplayNamePlaceholder",
-                            {
-                              defaultValue: "例如: DeepSeek V4 Flash",
-                            },
-                          )}
-                          aria-label={t("codexConfig.catalogColumnDisplay", {
-                            defaultValue: "菜单显示名",
-                          })}
-                        />
-                        <div className="flex gap-1">
-                          <Input
-                            value={row.model}
-                            onChange={(event) =>
-                              handleUpdateCatalogRow(index, {
-                                model: event.target.value,
-                              })
-                            }
-                            placeholder={t(
-                              "codexConfig.catalogModelPlaceholder",
-                              {
-                                defaultValue: "例如: deepseek-v4-flash",
-                              },
-                            )}
-                            aria-label={t("codexConfig.catalogColumnModel", {
-                              defaultValue: "实际请求模型",
-                            })}
-                            className="flex-1"
-                          />
-                          {fetchedModels.length > 0 && (
-                            <ModelDropdown
-                              models={fetchedModels}
-                              onSelect={(id) =>
-                                handleUpdateCatalogRow(index, {
-                                  model: id,
-                                  displayName: row.displayName?.trim()
-                                    ? row.displayName
-                                    : id,
-                                })
-                              }
-                            />
-                          )}
-                        </div>
-                        <Input
-                          type="number"
-                          min={1}
-                          inputMode="numeric"
-                          value={row.contextWindow ?? ""}
-                          onChange={(event) =>
-                            handleUpdateCatalogRow(index, {
-                              contextWindow: event.target.value.replace(
-                                /[^\d]/g,
-                                "",
-                              ),
-                            })
-                          }
-                          placeholder={t(
-                            "codexConfig.contextWindowPlaceholder",
-                            {
-                              defaultValue: "例如: 128000",
-                            },
-                          )}
-                          aria-label={t("codexConfig.catalogColumnContext", {
-                            defaultValue: "上下文窗口",
-                          })}
-                        />
-                        <ReasoningLevelsEditor
-                          levels={row.reasoningLevels}
-                          defaultLevel={row.defaultReasoningLevel}
-                          onLevelsChange={(levels) =>
-                            handleUpdateCatalogRow(index, {
-                              reasoningLevels: levels,
-                            })
-                          }
-                          onDefaultLevelChange={(level) =>
-                            handleUpdateCatalogRow(index, {
-                              defaultReasoningLevel: level,
-                            })
-                          }
-                        />
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="h-9 w-9 text-muted-foreground hover:text-destructive"
-                          onClick={() => handleRemoveCatalogRow(index)}
-                          title={t("common.delete", { defaultValue: "删除" })}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    ))}
+                        {catalogRows.map((row, index) => (
+                          <SortableCatalogRow
+                            key={row.rowId}
+                            rowId={row.rowId}
+                            accessibleName={`${catalogDragHandleLabel}: ${getCatalogRowLabel(row, index)}`}
+                          >
+                            <div className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_140px_1fr_36px]">
+                              <Input
+                                value={row.displayName ?? ""}
+                                onChange={(event) =>
+                                  handleUpdateCatalogRow(index, {
+                                    displayName: event.target.value,
+                                  })
+                                }
+                                placeholder={t(
+                                  "codexConfig.catalogDisplayNamePlaceholder",
+                                  {
+                                    defaultValue: "例如: DeepSeek V4 Flash",
+                                  },
+                                )}
+                                aria-label={t(
+                                  "codexConfig.catalogColumnDisplay",
+                                  {
+                                    defaultValue: "菜单显示名",
+                                  },
+                                )}
+                              />
+                              <div className="flex gap-1">
+                                <Input
+                                  value={row.model}
+                                  onChange={(event) =>
+                                    handleUpdateCatalogRow(index, {
+                                      model: event.target.value,
+                                    })
+                                  }
+                                  placeholder={t(
+                                    "codexConfig.catalogModelPlaceholder",
+                                    {
+                                      defaultValue: "例如: deepseek-v4-flash",
+                                    },
+                                  )}
+                                  aria-label={t(
+                                    "codexConfig.catalogColumnModel",
+                                    {
+                                      defaultValue: "实际请求模型",
+                                    },
+                                  )}
+                                  className="flex-1"
+                                />
+                                {fetchedModels.length > 0 && (
+                                  <ModelDropdown
+                                    models={fetchedModels}
+                                    onSelect={(id) =>
+                                      handleUpdateCatalogRow(index, {
+                                        model: id,
+                                        displayName: row.displayName?.trim()
+                                          ? row.displayName
+                                          : id,
+                                      })
+                                    }
+                                  />
+                                )}
+                              </div>
+                              <Input
+                                type="number"
+                                min={1}
+                                inputMode="numeric"
+                                value={row.contextWindow ?? ""}
+                                onChange={(event) =>
+                                  handleUpdateCatalogRow(index, {
+                                    contextWindow: event.target.value.replace(
+                                      /[^\d]/g,
+                                      "",
+                                    ),
+                                  })
+                                }
+                                placeholder={t(
+                                  "codexConfig.contextWindowPlaceholder",
+                                  {
+                                    defaultValue: "例如: 128000",
+                                  },
+                                )}
+                                aria-label={t(
+                                  "codexConfig.catalogColumnContext",
+                                  {
+                                    defaultValue: "上下文窗口",
+                                  },
+                                )}
+                              />
+                              <ReasoningLevelsEditor
+                                levels={row.reasoningLevels}
+                                defaultLevel={row.defaultReasoningLevel}
+                                onLevelsChange={(levels) =>
+                                  handleUpdateCatalogRow(index, {
+                                    reasoningLevels: levels,
+                                  })
+                                }
+                                onDefaultLevelChange={(level) =>
+                                  handleUpdateCatalogRow(index, {
+                                    defaultReasoningLevel: level,
+                                  })
+                                }
+                              />
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-9 w-9 text-muted-foreground hover:text-destructive"
+                                onClick={() => handleRemoveCatalogRow(index)}
+                                title={t("common.delete", {
+                                  defaultValue: "删除",
+                                })}
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </Button>
+                            </div>
+                          </SortableCatalogRow>
+                        ))}
+                      </SortableContext>
+                    </DndContext>
                   </div>
                 )}
               </div>
